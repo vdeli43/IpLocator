@@ -76,8 +76,9 @@ def argumentParser():
 	parser.add_argument('-P', '--progress_bar', action='store_true', default=False, help='Display a progress bar when run in terminal, default = False')
 	parser.add_argument('-FD', '--from_date', type=lambda d: datetime.strptime(d, '%Y-%m-%d'), help='From date - format YYY-MM-DD, default = none (from beginning of time)')
 	parser.add_argument('-TD', '--to_date', type=lambda d: datetime.strptime(d, '%Y-%m-%d'), help='To date - format YYY-MM-DD, default = none (until today)')
-	args=parser.parse_args()
-	#args=parser.parse_args('-P -D -O'.split()) #-FD 2016-11-12
+	parser.add_argument('--fetchall', action='store_true', default=False, help='Fetch all data from DB instead a row at a time. CAUTION: needs lots! of memory')
+	#args=parser.parse_args()
+	args=parser.parse_args('-P'.split()) #-FD 2016-11-12
 	args.table = 'CK' + args.table
 	if args.from_date != None:
 		args.from_date=args.from_date.strftime('%Y-%m-%d 00:00:00.000')
@@ -98,7 +99,7 @@ def build_SQL(m_args):
 		sql_statement += part
 	return sql_statement
 
-def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_connString,m_SQL, m_debug):
+def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_connString,m_SQL, m_debug, m_fetchall):
 	try:
 		connection = connect(m_connString['Server'],m_connString['User'],m_connString['Password'])
 		connection.select_db(m_connString['Database'])
@@ -108,8 +109,11 @@ def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_connString,m_S
 		#print (len(cur1))
 		#exit()
 		connection.execute_query(m_SQL)
-		cur1 = [r for r in connection]
-		connection.close()
+		if m_fetchall:
+			cur1 = [r for r in connection]
+			connection.close()
+		else:
+			cur1 = connection
 	except MSSQLDriverException as e:
 		print('MSSQLDriverException {}'.format(e))
 		return 0,None
@@ -140,6 +144,8 @@ def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_connString,m_S
 			pbar.update()
 	if m_isbar:
 		pbar.close()
+	if m_fetchall:
+		connection.close()
 	if m_debug:
 		actionsFile.close()
 	return counter, recipients
@@ -182,7 +188,7 @@ register_dialect(
     lineterminator = '\r\n',
     quoting = QUOTE_MINIMAL)
 
-rows_read, recipients = aggregateRecipientActionsPerCountryISOCode(args.progress_bar, ' '+args.table[2:], connString, SQL, args.debug)
+rows_read, recipients = aggregateRecipientActionsPerCountryISOCode(args.progress_bar, ' '+args.table[2:], connString, SQL, args.debug, args.fetchall)
 f = open(args.output_file, 'w')
 legend_from = args.from_date if args.from_date != None else 'the beginning of time'
 legend_to = args.to_date if args.to_date != None else 'today'
