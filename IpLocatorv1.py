@@ -21,9 +21,13 @@ from csv import writer
 from csv import register_dialect
 from csv import QUOTE_MINIMAL
 
-field_Timestamp = {'CKClicks':'click_date', 'CKOpens':'tmstamp'}
+field_Timestamp = {'CKClicks':'click_date', 'CKOpens':'tmstamp'}   # the date field to select from in each table (Clicks/ Opens)
 
 def InitializeConnections(ConfigFile='IpLocator.ini'):
+	# Initialization file (default=IpLocator.ini) with two sections:
+	# [CONNECTION} section with connection string parameters and
+	# [GEODATABASE} section with the pathname of the GeoIP database file
+	# Returns: connectionString toMSSQL and gi handler to GeoIP database
 	ConnectionString = ''
 	config = ConfigParser()
 	try:
@@ -31,8 +35,8 @@ def InitializeConnections(ConfigFile='IpLocator.ini'):
 			config.read_file(f)
 		Section = 'CONNECTION'
 		if config.has_section(Section):
-			#Driver = config[Section]['Driver']
-			Server = config[Section]['Server']
+			#Driver = config[Section]['Driver'] # only used for odbc connections, not in pymssql or _mssql
+			Server = config[Section]['Server']  # server\instance_name
 			Database = config[Section]['Database']
 			Uid = config[Section]['Uid']
 			Pwd = config[Section]['Pwd']
@@ -70,7 +74,8 @@ def argumentParser():
 	output_file = ''
 	progress_bar = ''
 	parser = ArgumentParser(prog='IPLocator', description='Retrieve country origination of Clicks/ Opens')
-	parser.add_argument('-D', '--debug', default=False, action='store_true', help='Generate debug files as TotalActions.csv and AggregatedActions.csv, Default = False')
+	parser.add_argument('-C', '--config_file', default='IpLocator.ini', help='Pathname of ini file, default=IpLocator.init')
+	parser.add_argument('-D', '--debug', default=False, action='store_true', help='Generate debug files as recipients_single_country.csv, TotalActions.csv and AggregatedActions.csv, Default = False')
 	parser.add_argument('-T', '--table', default='Clicks', choices=['Clicks', 'Opens'], help='OperationalTable (Clicks/ Opens. Default=Clicks')
 	parser.add_argument('-O', '--output_file', default='Out.txt', help='Output file name')
 	parser.add_argument('-P', '--progress_bar', action='store_true', default=False, help='Display a progress bar when run in terminal, default = False')
@@ -78,7 +83,7 @@ def argumentParser():
 	parser.add_argument('-TD', '--to_date', type=lambda d: datetime.strptime(d, '%Y-%m-%d'), help='To date - format YYY-MM-DD, default = none (until today)')
 	parser.add_argument('--fetchall', action='store_true', default=False, help='Fetch all data from DB instead a row at a time. CAUTION: needs lots! of memory')
 	#args=parser.parse_args()
-	args=parser.parse_args('-P'.split()) #-FD 2016-11-12
+	args=parser.parse_args('-P -D -FD 2016-11-01'.split()) #-FD 2016-11-01
 	args.table = 'CK' + args.table
 	if args.from_date != None:
 		args.from_date=args.from_date.strftime('%Y-%m-%d 00:00:00.000')
@@ -88,7 +93,9 @@ def argumentParser():
 
 
 def build_SQL(m_args):
-	sql_statement = "SELECT subid2, ip_address FROM {}".format(args.table)
+	# Construct SQL SLECT STRINGS according to arguments
+	sql_statement1 = "SELECT subid2, ip_address FROM {}".format(args.table) # the actual selection
+	sql_statement2 = "SELECT count(*) FROM {}".format(args.table) # just a counter to get the number of rows
 	if (args.from_date != None or args.to_date != None):
 		if (args.from_date != None and args.to_date != None):
 			part = " WHERE {} >= '{}' AND {} <= '{}'".format(field_Timestamp[args.table], args.from_date, field_Timestamp[args.table], args.to_date)
@@ -96,23 +103,24 @@ def build_SQL(m_args):
 			part = " WHERE {} >= '{}'".format(field_Timestamp[args.table], args.from_date)
 		else:
 			part =" WHERE {} <= '{}'".format(field_Timestamp[args.table], args.to_date)
-		sql_statement += part
-	return sql_statement
+		sql_statement1 += part
+		sql_statement2 += part
+	return sql_statement1, sql_statement2
 
 def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_connString,m_SQL, m_debug, m_fetchall):
+	numberOfRows = 0
+	cur1 = None
 	try:
 		connection = connect(m_connString['Server'],m_connString['User'],m_connString['Password'])
 		connection.select_db(m_connString['Database'])
-		#connection.execute_query('SELECT count(*) from CKOpens')
-		#cur1 = 	[r for r in connection]
-		#print(cur1)
-		#print (len(cur1))
-		#exit()
-		connection.execute_query(m_SQL)
 		if m_fetchall:
+			print("Fetching data, please wait...")
+			connection.execute_query(m_SQL[0])
 			cur1 = [r for r in connection]
 			connection.close()
 		else:
+			numberOfRows = connection.execute_scalar(m_SQL[1])
+			connection.execute_query(m_SQL[0])
 			cur1 = connection
 	except MSSQLDriverException as e:
 		print('MSSQLDriverException {}'.format(e))
@@ -120,14 +128,19 @@ def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_connString,m_S
 	except MSSQLDatabaseException as e:
 		print('MSSQLDatabaseException {}'.format(e))
 		return 0,None
+	recipients = {}
+	counter = 0
+	
 	if m_debug:
 		actionsFile = open('TotalActions.csv', 'w')
 		debugdatawriter = writer(actionsFile, dialect='mydialect')
 		debugdatawriter.writerow(["Recipient ID","CountryISOCode","IP"])
-	recipients = {}
-	counter = 0
+
 	if m_isbar:
-		pbar = tqdm(iterable=cur1,desc="Aggregating ",unit=m_unit, miniters=0, mininterval = 2) #, unit_scale=True)
+		if m_fetchall:
+			pbar = tqdm(iterable=cur1,desc="Aggregating ",unit=m_unit, miniters=0, mininterval = 1) #, unit_scale=True)
+		else:
+			pbar = tqdm(total=numberOfRows,desc="Aggregating ",unit=m_unit, miniters=0, mininterval = 1) #, unit_scale=True)
 	for r in cur1:
 		country_name = gi.country_code_by_addr(r[1])
 		internal_id = r[0].split("_")[0][1:]
@@ -144,10 +157,10 @@ def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_connString,m_S
 			pbar.update()
 	if m_isbar:
 		pbar.close()
-	if m_fetchall:
-		connection.close()
 	if m_debug:
 		actionsFile.close()
+	if m_fetchall:
+		connection.close()
 	return counter, recipients
 
 def GetListOfKeysCorrespondingToMaxValues(mahdict):
@@ -172,10 +185,10 @@ def GetRelevantMaxCountry(mahdict):
         return 'FR'
     return temp[0]
 
-
+### MAIN ###
 args = argumentParser()
 SQL = build_SQL(args)
-connString, gi = InitializeConnections()
+connString, gi = InitializeConnections(args.config_file)
 if (connString == None or gi == None):
 	exit()
 
@@ -189,6 +202,7 @@ register_dialect(
     quoting = QUOTE_MINIMAL)
 
 rows_read, recipients = aggregateRecipientActionsPerCountryISOCode(args.progress_bar, ' '+args.table[2:], connString, SQL, args.debug, args.fetchall)
+	
 f = open(args.output_file, 'w')
 legend_from = args.from_date if args.from_date != None else 'the beginning of time'
 legend_to = args.to_date if args.to_date != None else 'today'
@@ -215,6 +229,7 @@ for k in recipients:
 	if len(recipient_countries) > 1:
 		multiples += 1
 	recipients_single_country[k] = GetRelevantMaxCountry(recipient_countries)
+
 if args.debug:
 	aggregatedActionsFile.close()
 
@@ -224,11 +239,11 @@ res = OrderedDict(sorted(Counter(recipients_single_country.values()).items(), ke
 for i in res:
 	f.write("Country: {} -> {}ers: {}\n".format(i,args.table[2:-1], res[i]))
 
-
-outputDebugFile = open('recipients_single_country.csv', 'w')
-debugdatawriter = writer(outputDebugFile, dialect='mydialect')
-debugdatawriter.writerow(["Recipient ID","Country ISO Code"])
-for resp in recipients_single_country:
-	debugdatawriter.writerow([resp,recipients_single_country[resp]])
-outputDebugFile.close()
+if args.debug:
+	outputDebugFile = open('recipients_single_country.csv', 'w')
+	debugdatawriter = writer(outputDebugFile, dialect='mydialect')
+	debugdatawriter.writerow(["Recipient ID","Country ISO Code"])
+	for resp in recipients_single_country:
+		debugdatawriter.writerow([resp,recipients_single_country[resp]])
+	outputDebugFile.close()
 
