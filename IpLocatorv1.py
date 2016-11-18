@@ -12,22 +12,59 @@ from pygeoip import GeoIPError
 from pygeoip import MEMORY_CACHE
 from pygeoip import MMAP_CACHE
 from configparser import ConfigParser
-from _mssql import connect
-from _mssql import MSSQLDriverException
-from _mssql import MSSQLDatabaseException
+from pymssql import connect
+from pymssql import InterfaceError
+from pymssql import DatabaseError
+from pymssql import OperationalError
 from argparse import ArgumentParser
 from datetime import datetime
 from csv import writer
 from csv import register_dialect
 from csv import QUOTE_MINIMAL
+from sys import exc_info
+#from sys import OSError
 
 field_Timestamp = {'CKClicks':'click_date', 'CKOpens':'tmstamp'}   # the date field to select from in each table (Clicks/ Opens)
 
+class debugOutput():
+	# create and write debug and output files
+
+	register_dialect(
+	'mydialect',
+	delimiter = ',',
+	quotechar = '"',
+	doublequote = True,
+	skipinitialspace = True,
+	lineterminator = '\r\n',
+	quoting = QUOTE_MINIMAL)
+	
+	def __init__(self, fileName, fileType=0):
+		# fileType=0 -> csv, filType=1->normal text
+		if fileType != 0 and fileType != 1:
+			raise ValueError('Invalid Argument for fileType', debugOutput, fileName, fileType)
+		self.__fileType = fileType
+		self.__debugFile = open(fileName, 'w')
+		if fileType == 0:
+			self.__debugWriter = writer(self.__debugFile, dialect='mydialect')
+			
+	def __del__(self):
+		try:
+			self.__debugFile.close()
+		except AttributeError:
+			pass
+	
+	def write(self,line):
+		if self.__fileType == 0:
+			self.__debugWriter.writerow(line)
+		else:
+			 self.__debugFile.write(line)
+
+		
 def InitializeConnections(ConfigFile='IpLocator.ini'):
 	# Initialization file (default=IpLocator.ini) with two sections:
 	# [CONNECTION} section with connection string parameters and
 	# [GEODATABASE} section with the pathname of the GeoIP database file
-	# Returns: connectionString toMSSQL and gi handler to GeoIP database
+	# Returns: connection to MSSQL and gi handler to GeoIP database
 	ConnectionString = ''
 	config = ConfigParser()
 	try:
@@ -46,8 +83,10 @@ def InitializeConnections(ConfigFile='IpLocator.ini'):
 		connectionString = {}
 		connectionString['Server'] = Server
 		connectionString['User'] = Uid
-		connectionString['Password'] = Pwd
+		connectionString['Password'] =  Pwd
 		connectionString['Database'] = Database
+		connection = connect(connectionString['Server'],connectionString['User'],connectionString['Password'], connectionString['Database'])
+		
 		Section = 'GEODATABASE'
 		if config.has_section(Section):
 			GeoIPFile = config[Section]['GeoIPFile']
@@ -63,10 +102,16 @@ def InitializeConnections(ConfigFile='IpLocator.ini'):
 	except KeyError as e:
 		print('Item {} does not exist in configuration file {}.'.format(e,ConfigFile))
 		return None, None
-	except Error as e:
-		print('{}\n{}'.format(ConnectionString,e))
+	except InterfaceError as e:
+		print('InterfaceError {}'.format(e))
+		return None,None
+	except DatabaseError as e:
+		print('DatabaseError {}'.format(e))
+		return None,None	
+	except :
+		print('{}\n{}'.format(connectionString, exc_info()[0]))
 		return None, None
-	return connectionString, gi
+	return connection, gi
 
 
 def argumentParser():
@@ -83,7 +128,7 @@ def argumentParser():
 	parser.add_argument('-TD', '--to_date', type=lambda d: datetime.strptime(d, '%Y-%m-%d'), help='To date - format YYY-MM-DD, default = none (until today)')
 	parser.add_argument('--fetchall', action='store_true', default=False, help='Fetch all data from DB instead a row at a time. CAUTION: needs lots! of memory')
 	#args=parser.parse_args()
-	args=parser.parse_args('-P -D -FD 2016-11-01'.split()) #-FD 2016-11-01
+	args=parser.parse_args('-C IpLocatorZAX.ini -P -D -FD 2016-06-15'.split()) #-FD 2016-11-01
 	args.table = 'CK' + args.table
 	if args.from_date != None:
 		args.from_date=args.from_date.strftime('%Y-%m-%d 00:00:00.000')
@@ -107,45 +152,44 @@ def build_SQL(m_args):
 		sql_statement2 += part
 	return sql_statement1, sql_statement2
 
-def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_connString,m_SQL, m_debug, m_fetchall):
+def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_conn ,m_SQL, m_debug, m_dbgType, m_fetchall):
 	numberOfRows = 0
-	cur1 = None
+	cur1 = m_conn.cursor()
 	try:
-		connection = connect(m_connString['Server'],m_connString['User'],m_connString['Password'])
-		connection.select_db(m_connString['Database'])
 		if m_fetchall:
 			print("Fetching data, please wait...")
-			connection.execute_query(m_SQL[0])
-			cur1 = [r for r in connection]
-			connection.close()
+			cur1.execute(m_SQL[0])
+			rows = cur1.fetchall()
 		else:
-			numberOfRows = connection.execute_scalar(m_SQL[1])
-			connection.execute_query(m_SQL[0])
-			cur1 = connection
-	except MSSQLDriverException as e:
-		print('MSSQLDriverException {}'.format(e))
+			cur1.execute(m_SQL[1])
+			numberOfRows = cur1.fetchone()[0]
+			cur1.close()
+			cur1 = m_conn.cursor()
+			cur1.execute(m_SQL[0])
+			rows = cur1
+	except InterfaceError as e:
+		print('InterfaceError {}'.format(e))
+		cur1.close()
 		return 0,None
-	except MSSQLDatabaseException as e:
-		print('MSSQLDatabaseException {}'.format(e))
+	except DatabaseError as e:
+		print('DatabaseError {}'.format(e))
+		cur1.close()
 		return 0,None
 	recipients = {}
 	counter = 0
-	
-	if m_debug:
-		actionsFile = open('TotalActions.csv', 'w')
-		debugdatawriter = writer(actionsFile, dialect='mydialect')
-		debugdatawriter.writerow(["Recipient ID","CountryISOCode","IP"])
 
 	if m_isbar:
 		if m_fetchall:
 			pbar = tqdm(iterable=cur1,desc="Aggregating ",unit=m_unit, miniters=0, mininterval = 1) #, unit_scale=True)
 		else:
 			pbar = tqdm(total=numberOfRows,desc="Aggregating ",unit=m_unit, miniters=0, mininterval = 1) #, unit_scale=True)
-	for r in cur1:
+	for r in rows:
 		country_name = gi.country_code_by_addr(r[1])
 		internal_id = r[0].split("_")[0][1:]
+		if not internal_id.isdigit():
+			continue
 		if m_debug:
-			debugdatawriter.writerow([internal_id,country_name,r[1]])
+			m_dbgType.write([internal_id,country_name,r[1]])
 		if internal_id not in recipients:
 			recipients[internal_id] = {}
 		if country_name not in recipients[internal_id]:
@@ -157,10 +201,7 @@ def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_connString,m_S
 			pbar.update()
 	if m_isbar:
 		pbar.close()
-	if m_debug:
-		actionsFile.close()
-	if m_fetchall:
-		connection.close()
+	cur1.close()
 	return counter, recipients
 
 def GetListOfKeysCorrespondingToMaxValues(mahdict):
@@ -185,65 +226,114 @@ def GetRelevantMaxCountry(mahdict):
         return 'FR'
     return temp[0]
 
+
+def assignBestRecipientCountryISOCode(m_recipients, m_debug, m_dbgType):
+	# finds the most common Country ISOCode among recipient actions
+	# returns a dict with recipient: ISOCode and the number of recipients with actions from more than one countries (multiples)
+	m_multiples = 0
+	m_recipients_single_country = {}
+	for k in m_recipients:
+		m_recipient_countries = m_recipients[k]
+		if m_debug:
+			m_debugrow = list()
+			m_debugrow.append(k)
+			m_debugrow.append(m_recipient_countries)
+			m_dbgType.write(m_debugrow)
+		if len(m_recipient_countries) > 1:
+			m_multiples += 1
+		m_recipients_single_country[k] = GetRelevantMaxCountry(m_recipient_countries) #Nikolas
+	return m_multiples, m_recipients_single_country   
+
 ### MAIN ###
 args = argumentParser()
 SQL = build_SQL(args)
-connString, gi = InitializeConnections(args.config_file)
-if (connString == None or gi == None):
-	exit()
+conn, gi = InitializeConnections(args.config_file)
+if (conn == None or gi == None):
+	exit(1)
 
-register_dialect(
-    'mydialect',
-    delimiter = ',',
-    quotechar = '"',
-    doublequote = True,
-    skipinitialspace = True,
-    lineterminator = '\r\n',
-    quoting = QUOTE_MINIMAL)
+if args.debug:
+	try:
+		dbgAggregatedActions = debugOutput('AggregatedActions.csv')
+		dbgTotalActions = debugOutput('TotalActions.csv')
+		dbgSingleCountry = debugOutput('recipients_single_country.csv')
+	except (OSError, ValueError) as e:
+		print(e.args)
+		conn.close()
+		errno = e.args[0]
+		exit(errno)
+	dbgAggregatedActions.write(["Recipient ID","Country ISO Codes"])		
+	dbgTotalActions.write(["Recipient ID","CountryISOCode","IP"])
+	dbgSingleCountry.write(["Recipient ID","Country ISO Code"])		
 
-rows_read, recipients = aggregateRecipientActionsPerCountryISOCode(args.progress_bar, ' '+args.table[2:], connString, SQL, args.debug, args.fetchall)
+try:
+	dbgOut = debugOutput(args.output_file,1)
+except (OSError, ValueError) as e:
+	print (e.args)
+	conn.close()
+	errno = e.args[0]
+	exit(errno)
+
+rows_read, recipients = aggregateRecipientActionsPerCountryISOCode(args.progress_bar, ' '+args.table[2:], conn, SQL, args.debug, dbgTotalActions, args.fetchall)
 	
-f = open(args.output_file, 'w')
 legend_from = args.from_date if args.from_date != None else 'the beginning of time'
 legend_to = args.to_date if args.to_date != None else 'today'
-f.write ("{} rows, {} unique {} from {} until {}\n".format(rows_read, len(recipients) if recipients != None else 0, args.table[2:-1]+'ers', legend_from, legend_to))
+dbgOut.write("{} rows, {} unique {} from {} until {}\n".format(rows_read, len(recipients) if recipients != None else 0, args.table[2:-1]+'ers', legend_from, legend_to))
 if recipients == None:
-	f.close()
+	del dbgOut
+	del dbgAggregatedActions
+	del dbgTotalActions
+	del dbgSingleCountry
+	conn.close()
 	exit()
 	
-recipients_single_country = {}
-multiples = 0
+multiples, recipients_single_country = assignBestRecipientCountryISOCode(recipients, args.debug, dbgAggregatedActions)
 
-if args.debug:
-	aggregatedActionsFile = open('AggregatedActions.csv', 'w')
-	debugdatawriter = writer(aggregatedActionsFile, dialect='mydialect')
-	debugdatawriter.writerow(["Recipient ID","Country ISO Codes"])
-	
-for k in recipients:
-	recipient_countries = recipients[k]
-	if args.debug:
-		debugrow = list()
-		debugrow.append(k)
-		debugrow.append(recipient_countries)
-		debugdatawriter.writerow(debugrow)
-	if len(recipient_countries) > 1:
-		multiples += 1
-	recipients_single_country[k] = GetRelevantMaxCountry(recipient_countries)
-
-if args.debug:
-	aggregatedActionsFile.close()
-
-f.write ("{} multiples found in {} recipients\n\n".format(multiples,len(recipients)))
+dbgOut.write ("{} multiples found in {} recipients\n\n".format(multiples,len(recipients)))
 
 res = OrderedDict(sorted(Counter(recipients_single_country.values()).items(), key=lambda t: t[1], reverse=True))
 for i in res:
-	f.write("Country: {} -> {}ers: {}\n".format(i,args.table[2:-1], res[i]))
+	dbgOut.write("Country: {} -> {}ers: {}\n".format(i,args.table[2:-1], res[i]))
+
+
+try:
+	cur1 = conn.cursor()
+	cur1.execute("""
+	IF OBJECT_ID('RecipientsRealCountry', 'U') IS NOT NULL
+		DROP TABLE RecipientsRealCountry
+	CREATE TABLE RecipientsRealCountry(id INT NOT NULL, country VARCHAR(10))
+	""")
+	conn.commit()
+	cur1.close()
+except InterfaceError as e:
+	print('InterfaceError {}'.format(e))
+	exit()
+except DatabaseError as e:
+	if e.number == 2714 and e.severity == 16:
+		# Database already exits
+		pass
+	else:
+		print('DatabaseError {}'.format(e))
+		exit()
+
+cur1 = conn.cursor()
+for resp in recipients_single_country:
+	if args.debug:
+		dbgSingleCountry.write([resp,recipients_single_country[resp]])
+		try:
+			cur1.execute("INSERT INTO RecipientsRealCountry VALUES(%d,%s)",(resp,recipients_single_country[resp]))
+		except OperationalError as e:
+			if e.args[0] == 245:# and e.severity == 16:
+				# id must be numeric, TEST id
+				break
+			else:
+				print('DatabaseError {}'.format(e))
+				exit()
+		finally:
+			conn.commit()
 
 if args.debug:
-	outputDebugFile = open('recipients_single_country.csv', 'w')
-	debugdatawriter = writer(outputDebugFile, dialect='mydialect')
-	debugdatawriter.writerow(["Recipient ID","Country ISO Code"])
-	for resp in recipients_single_country:
-		debugdatawriter.writerow([resp,recipients_single_country[resp]])
-	outputDebugFile.close()
-
+	del dbgAggregatedActions
+	del dbgTotalActions
+	del dbgSingleCountry
+conn.close()
+del dbgOut
