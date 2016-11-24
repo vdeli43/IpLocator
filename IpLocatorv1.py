@@ -16,6 +16,7 @@ from pymssql import connect
 from pymssql import InterfaceError
 from pymssql import DatabaseError
 from pymssql import OperationalError
+from pymssql import ProgrammingError
 from argparse import ArgumentParser
 from datetime import datetime
 from csv import writer
@@ -24,6 +25,32 @@ from csv import QUOTE_MINIMAL
 from sys import exc_info
 #from sys import OSError
 
+def createProcedureFromFile(filename, m_conn):
+	# Open and read the file as a single buffer
+	try:
+		with open(filename, 'r') as fd:
+			sqlFile = fd.read()
+	except IOError as e:
+		print('{}'.format(e))
+		return False
+	finally:
+		fd.close()
+	cur1 = m_conn.cursor(as_dict=False)
+	try:
+		command='SET ANSI_NULLS ON'
+		cur1.execute(command)
+		command='SET QUOTED_IDENTIFIER ON'
+		cur1.execute(command)
+		command=sqlFile
+		cur1.execute(command)
+	except (OperationalError, ProgrammingError) as msg:
+		print ("Command skipped:{}\n{} ".format(command,msg))
+		cur1.close()
+		return False
+	
+	cur1.close()
+	return True
+		
 class debugOutput():
 	# create and write debug and output files
 
@@ -120,53 +147,32 @@ def argumentParser():
 	parser = ArgumentParser(prog='IPLocator', description='Retrieve country origination of Clicks/ Opens')
 	parser.add_argument('-C', '--config_file', default='IpLocator.ini', help='Pathname of ini file, default=IpLocator.init')
 	parser.add_argument('-D', '--debug', default=False, action='store_true', help='Generate debug files as recipients_single_country.csv, TotalActions.csv and AggregatedActions.csv, Default = False')
-	parser.add_argument('-T', '--table', default='Clicks', choices=['Clicks', 'Opens'], help='OperationalTable (Clicks/ Opens. Default=Clicks')
+	parser.add_argument('-T', '--table', default='Clicks', choices=['Clicks', 'Opens'], help='OperationalTable (Clicks/ Opensh. Default=Clicks')
 	parser.add_argument('-O', '--output_file', default='Out.txt', help='Output file name')
 	parser.add_argument('-P', '--progress_bar', action='store_true', default=False, help='Display a progress bar when run in terminal, default = False')
 	parser.add_argument('-FD', '--from_date', type=lambda d: datetime.strptime(d, '%Y-%m-%d'), help='From date - format YYY-MM-DD, default = none (from beginning of time)')
 	parser.add_argument('-TD', '--to_date', type=lambda d: datetime.strptime(d, '%Y-%m-%d'), help='To date - format YYY-MM-DD, default = none (until today)')
 	parser.add_argument('--fetchall', action='store_true', default=False, help='Fetch all data from DB instead a row at a time. CAUTION: needs lots! of memory')
-	#args=parser.parse_args()
-	args=parser.parse_args('-P -D -FD 2016-11-20'.split()) #-FD 2016-11-01 -C IpLocatorZAX.ini
-	args.table = 'CK' + args.table
+	args=parser.parse_args()
+	args=parser.parse_args('-T Clicks -FD 2016-11-20 -P'.split()) #-FD 2016-11-01 -C IpLocatorZAX.ini
+	#args.table = 'CK' + args.table
 	if args.from_date != None:
 		args.from_date=args.from_date.strftime('%Y-%m-%d 00:00:00.000')
 	if args.to_date != None:
 		args.to_date=args.to_date.strftime('%Y-%m-%d 23:59:59.999')
 	return args
-	
 
-def build_SQL(m_args):
-	# Construct SQL SLECT STRINGS according to arguments
-	field_Timestamp = {'CKClicks':'click_date', 'CKOpens':'tmstamp'}   # the date field to select from in each table (Clicks/ Opens)
-	sql_statement1 = "SELECT subid2, ip_address FROM {}".format(args.table) # the actual selection
-	sql_statement2 = "SELECT count(*) FROM {}".format(args.table) # just a counter to get the number of rows
-	if (args.from_date != None or args.to_date != None):
-		if (args.from_date != None and args.to_date != None):
-			part = " WHERE {} >= '{}' AND {} <= '{}'".format(field_Timestamp[args.table], args.from_date, field_Timestamp[args.table], args.to_date)
-		elif args.from_date != None:
-			part = " WHERE {} >= '{}'".format(field_Timestamp[args.table], args.from_date)
-		else:
-			part =" WHERE {} <= '{}'".format(field_Timestamp[args.table], args.to_date)
-		sql_statement1 += part
-		sql_statement2 += part
-	return sql_statement1, sql_statement2
-
-def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_conn ,m_SQL, m_debug, m_dbgType, m_fetchall):
+def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_conn ,m_table, m_fromDate, m_toDate, m_debug, m_dbgType):
+	m_unit = ' '+m_table
 	numberOfRows = 0
-	cur1 = m_conn.cursor()
+	cur1 = m_conn.cursor(as_dict=False)
 	try:
-		if m_fetchall:
-			print("Fetching data, please wait...")
-			cur1.execute(m_SQL[0])
-			rows = cur1.fetchall()
-		else:
-			cur1.execute(m_SQL[1])
-			numberOfRows = cur1.fetchone()[0]
-			cur1.close()
-			cur1 = m_conn.cursor()
-			cur1.execute(m_SQL[0])
-			rows = cur1
+		print("Fetching {} data, please wait...".format(m_table))
+		cur1.callproc('#RC_getActions', (m_table, m_fromDate , m_toDate ,'TRUE'))
+		numberOfRows = [x for x in cur1][0][0]
+		cur1.close()
+		cur1 = m_conn.cursor(as_dict=False)
+		cur1.callproc('#RC_getActions', (m_table, m_fromDate , m_toDate ,'FALSE'))
 	except InterfaceError as e:
 		print('InterfaceError {}'.format(e))
 		cur1.close()
@@ -175,18 +181,25 @@ def aggregateRecipientActionsPerCountryISOCode(m_isbar, m_unit ,m_conn ,m_SQL, m
 		print('DatabaseError {}'.format(e))
 		cur1.close()
 		return 0,None
+
 	recipients = {}
 	counter = 0
 
 	if m_isbar:
-		if m_fetchall:
-			pbar = tqdm(iterable=cur1,desc="Aggregating ",unit=m_unit, miniters=0, mininterval = 1) #, unit_scale=True)
-		else:
-			pbar = tqdm(total=numberOfRows,desc="Aggregating ",unit=m_unit, miniters=0, mininterval = 1) #, unit_scale=True)
-	for r in rows:
+		pbar = tqdm(total=numberOfRows,desc="Aggregating ",unit=m_unit, miniters=0, mininterval = 1) #, unit_scale=True)
+	for r in cur1:
 		country_name = gi.country_code_by_addr(r[1])
 		internal_id = r[0].split("_")[0][1:]
-		if not internal_id.isdigit():
+		try:
+			internal_id = int(internal_id)
+		except:
+			continue
+		#if not isinstance(internal_id,int):
+			#print(internal_id)
+		#if not internal_id.isdigit():
+			#continue
+		if internal_id > 1000000000 or internal_id  < 1:
+			#print("Large Recipient_id found: {}".format(internal_id))
 			continue
 		if m_debug:
 			m_dbgType.write([internal_id,country_name,r[1]])
@@ -244,41 +257,65 @@ def assignBestRecipientCountryISOCode(m_recipients, m_debug, m_dbgType):
 		m_recipients_single_country.append((k,GetRelevantMaxCountry(m_recipient_countries))) #Nikolas
 	return m_multiples, m_recipients_single_country   
 
-def writeRecipientsSingleCountry(m_conn, m_recipients_single_country, m_debug, m_dbgSingleCountry, m_isbar, m_unit, m_writeBlocks=50):
-	# Write RecipientId,CountryISOCode to DB (Table RecipientsRealCountry)
-	# If table exists drop it and recreate (change to append?)
+def writeRecipientsSingleCountry(m_conn, m_recipients_single_country, m_debug, m_dbgSingleCountry, m_isbar, m_unit, m_writeBlocks=50, m_temp=True):
+	# Write RecipientId,CountryISOCode to (temp) DB (Table (#)RecipientsRealCountry)
+	# m_temp=True-> write a temp table
+	# m_temp=False -> excute join proc and write the actual table
+	if m_temp:
+		m_table = '#RecipientsRealCountry'
+		m_desc = 'Writing Temp Table '
+	else:
+		m_table = 'RecipientsRealCountry'
+		m_desc = 'Writing Table '
+	m_sqlCreateTable = """
+	IF OBJECT_ID('{0}', 'U') IS NOT NULL
+		DROP TABLE {0}
+	CREATE TABLE {0}(id INT NOT NULL, country VARCHAR(10))
+	""".format(m_table)
+	m_sqlInsertRows = r"INSERT INTO {} VALUES(%d,%s)".format(m_table)
 	try:
 		cur1 = m_conn.cursor()
-		cur1.execute("""
-		IF OBJECT_ID('RecipientsRealCountry', 'U') IS NOT NULL
-			DROP TABLE RecipientsRealCountry
-		CREATE TABLE RecipientsRealCountry(id INT NOT NULL, country VARCHAR(10))
-		""")
+		cur1.execute(m_sqlCreateTable)
 		m_conn.commit()
 		cur1.close()
-	except InterfaceError as e:
+	except (InterfaceError, DatabaseError) as e:
 		print('InterfaceError {}'.format(e))
 		return(e.args[0])
-	except DatabaseError as e:
-		if e.number == 2714 and e.severity == 16:
-			# Database already exits
-			pass
-		else:
-			print('DatabaseError {}'.format(e))
+
+	if m_temp == False:
+		cur1 = m_conn.cursor(as_dict=False)
+		try:
+			print("Joining {} data, please wait...".format(m_table))
+			cur1.callproc('#RC_findFaultyRecipients')
+		except InterfaceError as e:
+			print('InterfaceError {}'.format(e))
+			cur1.close()
 			return(e.args[0])
+		except DatabaseError as e:
+			print('DatabaseError {}'.format(e))
+			cur1.close()
+			return(e.args[0])
+		m_recipients_single_country.clear()
+		if m_isbar:
+			join_pbar = tqdm(total=-1,desc="Joining ",unit=m_unit, miniters=0, mininterval = 1) #, unit_scale=True)
+		for row in cur1:
+			m_recipients_single_country.append(row)
+			if m_isbar:
+				join_pbar.update()
+		join_pbar.close()
+	
+		if m_debug:
+			for j in m_recipients_single_country:
+				m_dbgSingleCountry.write(j)
 	
 	cur1 = m_conn.cursor()
-	for j in m_recipients_single_country:
-		if m_debug:
-			m_dbgSingleCountry.write(j)
-	
 	Start = 0
 	End = m_writeBlocks
 	if m_isbar:
-		pbar = tqdm(total=len(m_recipients_single_country),desc="Writing ",unit=m_unit) #, unit_scale=True)
+		pbar = tqdm(total=len(m_recipients_single_country), desc=m_desc, unit=m_unit) #, unit_scale=True)
 	while End < len(m_recipients_single_country):
 		try:
-			cur1.executemany("INSERT INTO RecipientsRealCountry VALUES(%d,%s)",m_recipients_single_country[Start:End])
+			cur1.executemany(m_sqlInsertRows,m_recipients_single_country[Start:End])
 		except OperationalError as e:
 			print('DatabaseError {}'.format(e))
 			return(e.args[0])
@@ -290,7 +327,7 @@ def writeRecipientsSingleCountry(m_conn, m_recipients_single_country, m_debug, m
 		End = Start + m_writeBlocks
 	if Start < len(m_recipients_single_country)-1:
 		try:
-			cur1.executemany("INSERT INTO RecipientsRealCountry VALUES(%d,%s)",m_recipients_single_country[Start:])
+			cur1.executemany(m_sqlInsertRows,m_recipients_single_country[Start:])
 		except OperationalError as e:
 			print('DatabaseError {}'.format(e))
 			return(e.args[0])
@@ -299,14 +336,17 @@ def writeRecipientsSingleCountry(m_conn, m_recipients_single_country, m_debug, m
 		if m_isbar:
 			pbar.update(len(m_recipients_single_country)-Start)
 			pbar.close()
+	
 	return 0
 				
 ### MAIN ###
 args = argumentParser()
-SQL = build_SQL(args)
 conn, gi, writeBlocks = InitializeConnections(args.config_file)
 if (conn == None or gi == None):
 	exit(1)
+dbgAggregatedActions = None
+dbgTotalActions = None
+dbgSingleCountry = None
 
 try:
 	dbgOut = debugOutput(args.output_file,1)
@@ -323,11 +363,17 @@ except (OSError, ValueError) as e:
 	errno = e.args[0]
 	exit(errno)
 
-rows_read, recipients = aggregateRecipientActionsPerCountryISOCode(args.progress_bar, ' '+args.table[2:], conn, SQL, args.debug, dbgTotalActions, args.fetchall)
-	
+#create temp proc #RC_getActions
+if createProcedureFromFile('RC_getActions.sql', conn) == False:
+	exit(1)
+
+rows_read, recipients = aggregateRecipientActionsPerCountryISOCode(args.progress_bar, conn, args.table, args.from_date, args.to_date, args.debug, dbgTotalActions)
+
 legend_from = args.from_date if args.from_date != None else 'the beginning of time'
 legend_to = args.to_date if args.to_date != None else 'today'
-dbgOut.write("{} rows, {} unique {} from {} until {}\n".format(rows_read, len(recipients) if recipients != None else 0, args.table[2:-1]+'ers', legend_from, legend_to))
+totalRecipientsFound = len(recipients)
+
+dbgOut.write("{} rows, {} unique {} from {} until (not including) {}\n".format(rows_read, totalRecipientsFound if recipients != None else 0, args.table[:-1]+'ers', legend_from, legend_to))
 if recipients == None:
 	del dbgOut
 	del dbgAggregatedActions
@@ -338,13 +384,28 @@ if recipients == None:
 	
 multiples, recipients_single_country = assignBestRecipientCountryISOCode(recipients, args.debug, dbgAggregatedActions)
 
-dbgOut.write ("{} multiples found in {} recipients\n\n".format(multiples,len(recipients)))
+dbgOut.write ("{} multiples found in {} recipients\n".format(multiples,totalRecipientsFound))
 
+# Create temp teble (all recipients, country code)
+errno = writeRecipientsSingleCountry(conn, recipients_single_country, args.debug, dbgSingleCountry, args.progress_bar, ' '+args.table, m_writeBlocks=writeBlocks, m_temp=True)
+if errno != 0:
+	conn.close()
+	exit(errno)
+	
+#create temp proc #RC_findFaultyRecipients
+if createProcedureFromFile('RC_findFaultyRecipients.sql', conn) == False:
+	exit(1)
+
+# Create actual table (only recipients that exist in Recipients table and ...(see join proc)
+errno = writeRecipientsSingleCountry(conn, recipients_single_country, args.debug, dbgSingleCountry, args.progress_bar, ' '+args.table, m_writeBlocks=writeBlocks, m_temp=False)
+if errno != 0:
+	conn.close()
+	exit(errno)
+
+dbgOut.write("{} misplaced recipients\n".format(len(recipients_single_country)))
 res = sorted(Counter(country[1] for country in recipients_single_country).items(), key=lambda t: t[1] ,reverse=True)
 for i in res:
-	dbgOut.write("Country: {} -> {}ers: {}\n".format(i[0], args.table[2:-1], i[1]))
-
-errno = writeRecipientsSingleCountry(conn, recipients_single_country, args.debug, dbgSingleCountry, args.progress_bar, ' '+args.table[2:], writeBlocks)
+	dbgOut.write("Country: {0:3s} -> {1:5s}ers: {2:>7d} {3:>6.2f}%\n".format(i[0], args.table[:-1], i[1], i[1]/totalRecipientsFound*100))
 
 if args.debug:
 	del dbgAggregatedActions
